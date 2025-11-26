@@ -226,7 +226,10 @@ def reduce_scatter_pallas_scratch_specs(x):
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
-        # TODO: your code here
+        "send_sem": [pltpu.SemaphoreType.DMA] * 3,
+        "recv_sem": [pltpu.SemaphoreType.DMA] * 3,
+        "round1_data": pltpu.VMEM(shape=(x.shape[0] // 4, 8, 128), dtype=jnp.float32),
+        "round2_data": pltpu.VMEM(shape=(x.shape[0] // 4, 8, 128), dtype=jnp.float32)
     }
 
 
@@ -244,9 +247,44 @@ def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
       The set of resources allocated is determined by your implementation of
       `reduce_scatter_pallas_scratch_specs`.
     """
-
-    # TODO: your code here
-    pass
+    my_device = pallas_get_my_device_id()
+    chunk_size = x_ref.shape[0] // 4
+    next_device = (my_device + 1) % N_DEVICES
+    
+    send_sem_0 = scratch_refs["send_sem"][0]
+    recv_sem_0 = scratch_refs["recv_sem"][0]
+    send_sem_1 = scratch_refs["send_sem"][1]
+    recv_sem_1 = scratch_refs["recv_sem"][1]
+    send_sem_2 = scratch_refs["send_sem"][2]
+    recv_sem_2 = scratch_refs["recv_sem"][2]
+    round1_data = scratch_refs["round1_data"]
+    round2_data = scratch_refs["round2_data"]
+    
+    # step 0: send chunk (my_device + 3) % 4, receive/add chunk (my_device + 2) % 4
+    send_idx_0 = (my_device + 3) % N_DEVICES
+    recv_idx_0 = (my_device + 2) % N_DEVICES
+    
+    pallas_rdma_start(src_ref=x_ref.at[pl.ds(send_idx_0 * chunk_size, chunk_size)], dst_ref=round1_data, dst_device_id=next_device, src_send_sem=send_sem_0, dst_recv_sem=recv_sem_0)
+    pallas_rdma_wait_send(src_ref=x_ref.at[pl.ds(send_idx_0 * chunk_size, chunk_size)], src_send_sem=send_sem_0)
+    pallas_rdma_wait_recv(dst_ref=round1_data, dst_recv_sem=recv_sem_0)
+    round1_data[:] = round1_data[:] + x_ref[pl.ds(recv_idx_0 * chunk_size, chunk_size)]
+    
+    # step 1: send chunk (my_device + 2) % 4, receive/add chunk (my_device + 1) % 4
+    recv_idx_1 = (my_device + 1) % N_DEVICES
+    
+    pallas_rdma_start(src_ref=round1_data, dst_ref=round2_data, dst_device_id=next_device, src_send_sem=send_sem_1, dst_recv_sem=recv_sem_1)
+    
+    pallas_rdma_wait_recv(dst_ref=round2_data, dst_recv_sem=recv_sem_1)
+    round2_data[:] = round2_data[:] + x_ref[pl.ds(recv_idx_1 * chunk_size, chunk_size)]
+    pallas_rdma_wait_send(src_ref=round1_data, src_send_sem=send_sem_1)
+    
+    # step 2: send chunk (my_device + 1) % 4, receive/add chunk my_device (final)
+    # should have result now in out_ref
+    recv_idx_2 = my_device
+    pallas_rdma_start(src_ref=round2_data, dst_ref=out_ref, dst_device_id=next_device, src_send_sem=send_sem_2, dst_recv_sem=recv_sem_2)
+    pallas_rdma_wait_recv(dst_ref=out_ref, dst_recv_sem=recv_sem_2)
+    out_ref[:] = out_ref[:] + x_ref[pl.ds(recv_idx_2 * chunk_size, chunk_size)]
+    pallas_rdma_wait_send(src_ref=round2_data, src_send_sem=send_sem_2)
 
 
 def all_gather_pallas_scratch_specs(x):
