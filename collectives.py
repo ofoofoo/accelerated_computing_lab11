@@ -412,15 +412,7 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
     out_ref[pl.ds(prev_device * chunk_size, chunk_size)] = round1_data_prev[:]
     
     # step 2: forward the previously received chunks to next devices
-    # send chunk from next to prev
     # send chunk from prev to next
-    pallas_rdma_start(
-        src_ref=round1_data_next,
-        dst_ref=round2_data_prev,
-        dst_device_id=prev_device,
-        src_send_sem=send_sem_prev_1,
-        dst_recv_sem=recv_sem_prev_1
-    )
     
     pallas_rdma_start(
         src_ref=round1_data_prev,
@@ -430,17 +422,13 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
         dst_recv_sem=recv_sem_next_1
     )
     
-    # opposite chunk will arrive from both directions, pick one
     pallas_rdma_wait_recv(dst_ref=round2_data_next, dst_recv_sem=recv_sem_next_1)
     
     out_ref[pl.ds(opposite_device * chunk_size, chunk_size)] = round2_data_next[:]
     
-    # is there a way to get rid of this wait?
-    pallas_rdma_wait_recv(dst_ref=round2_data_prev, dst_recv_sem=recv_sem_prev_1)
     
     pallas_rdma_wait_send(src_ref=x_ref, src_send_sem=send_sem_next_0)
     pallas_rdma_wait_send(src_ref=x_ref, src_send_sem=send_sem_prev_0)
-    pallas_rdma_wait_send(src_ref=round1_data_next, src_send_sem=send_sem_prev_1)
     pallas_rdma_wait_send(src_ref=round1_data_prev, src_send_sem=send_sem_next_1)
 
 
