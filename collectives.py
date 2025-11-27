@@ -234,7 +234,6 @@ def reduce_scatter_pallas_scratch_specs(x):
         "round2_data": pltpu.VMEM(shape=(x.shape[0] // 4, 8, 128), dtype=jnp.float32)
     }
 
-
 def reduce_scatter_pallas_kernel(x_ref, out_ref, scratch_refs):
     """
     Reduce-scatters data across the 4 devices in the ring, splitting the input array along its
@@ -341,7 +340,12 @@ def all_gather_pallas_scratch_specs(x):
     # Works the same way as the earlier scratch specs function
     # (see `exchange_with_neighbor_pallas_scratch_specs` above)
     return {
-        # TODO: your code here
+        "send_sem": [pltpu.SemaphoreType.DMA] * 4,
+        "recv_sem": [pltpu.SemaphoreType.DMA] * 4,
+        "round1_data_next": pltpu.VMEM(shape=(x.shape[0], 8, 128), dtype=jnp.float32),
+        "round1_data_prev": pltpu.VMEM(shape=(x.shape[0], 8, 128), dtype=jnp.float32),
+        "round2_data_next": pltpu.VMEM(shape=(x.shape[0], 8, 128), dtype=jnp.float32),
+        "round2_data_prev": pltpu.VMEM(shape=(x.shape[0], 8, 128), dtype=jnp.float32),
     }
 
 
@@ -358,9 +362,86 @@ def all_gather_pallas_kernel(x_ref, out_ref, scratch_refs):
       The set of resources allocated is determined by your implementation of
       `all_gather_pallas_scratch_specs`.
     """
+    my_device = pallas_get_my_device_id()
+    chunk_size = x_ref.shape[0]
+    
+    next_device = (my_device + 1) % N_DEVICES
+    prev_device = (my_device - 1 + N_DEVICES) % N_DEVICES
+    opposite_device = (my_device + 2) % N_DEVICES
+    
+    send_sem_next_0 = scratch_refs["send_sem"][0]
+    send_sem_prev_0 = scratch_refs["send_sem"][1]
+    send_sem_next_1 = scratch_refs["send_sem"][2]
+    send_sem_prev_1 = scratch_refs["send_sem"][3]
+    recv_sem_next_0 = scratch_refs["recv_sem"][0]
+    recv_sem_prev_0 = scratch_refs["recv_sem"][1]
+    recv_sem_next_1 = scratch_refs["recv_sem"][2]
+    recv_sem_prev_1 = scratch_refs["recv_sem"][3]
+    
+    round1_data_next = scratch_refs["round1_data_next"]
+    round1_data_prev = scratch_refs["round1_data_prev"]
+    round2_data_next = scratch_refs["round2_data_next"]
+    round2_data_prev = scratch_refs["round2_data_prev"]
+    
+    out_ref[pl.ds(my_device * chunk_size, chunk_size)] = x_ref[:]
+    
+    # step 1: exchange with immediate neighbors
 
-    # TODO: your code here
-    pass
+    # send to next device (clockwise)
+    pallas_rdma_start(
+        src_ref=x_ref,
+        dst_ref=round1_data_prev,
+        dst_device_id=next_device,
+        src_send_sem=send_sem_next_0,
+        dst_recv_sem=recv_sem_prev_0
+    )
+    
+    # send to previous device (counter-clockwise)
+    pallas_rdma_start(
+        src_ref=x_ref,
+        dst_ref=round1_data_next,
+        dst_device_id=prev_device,
+        src_send_sem=send_sem_prev_0,
+        dst_recv_sem=recv_sem_next_0
+    )
+    
+    pallas_rdma_wait_recv(dst_ref=round1_data_next, dst_recv_sem=recv_sem_next_0)
+    pallas_rdma_wait_recv(dst_ref=round1_data_prev, dst_recv_sem=recv_sem_prev_0)
+    
+    out_ref[pl.ds(next_device * chunk_size, chunk_size)] = round1_data_next[:]
+    out_ref[pl.ds(prev_device * chunk_size, chunk_size)] = round1_data_prev[:]
+    
+    # step 2: forward the previously received chunks to next devices
+    # send chunk from next to prev
+    # send chunk from prev to next
+    pallas_rdma_start(
+        src_ref=round1_data_next,
+        dst_ref=round2_data_prev,
+        dst_device_id=prev_device,
+        src_send_sem=send_sem_prev_1,
+        dst_recv_sem=recv_sem_prev_1
+    )
+    
+    pallas_rdma_start(
+        src_ref=round1_data_prev,
+        dst_ref=round2_data_next,
+        dst_device_id=next_device,
+        src_send_sem=send_sem_next_1,
+        dst_recv_sem=recv_sem_next_1
+    )
+    
+    # opposite chunk will arrive from both directions, pick one
+    pallas_rdma_wait_recv(dst_ref=round2_data_next, dst_recv_sem=recv_sem_next_1)
+    
+    out_ref[pl.ds(opposite_device * chunk_size, chunk_size)] = round2_data_next[:]
+    
+    # is there a way to get rid of this wait?
+    pallas_rdma_wait_recv(dst_ref=round2_data_prev, dst_recv_sem=recv_sem_prev_1)
+    
+    pallas_rdma_wait_send(src_ref=x_ref, src_send_sem=send_sem_next_0)
+    pallas_rdma_wait_send(src_ref=x_ref, src_send_sem=send_sem_prev_0)
+    pallas_rdma_wait_send(src_ref=round1_data_next, src_send_sem=send_sem_prev_1)
+    pallas_rdma_wait_send(src_ref=round1_data_prev, src_send_sem=send_sem_next_1)
 
 
 ## <--- /your code here --->
