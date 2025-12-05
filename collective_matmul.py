@@ -165,8 +165,7 @@ def pallas_rdma_wait_recv(*, dst_ref, dst_recv_sem):
 
 
 def matmul_pallas_scratch_specs(x, w):
-    return {
-        # TODO: your code here
+    return { 
     }
 
 
@@ -180,14 +179,16 @@ def matmul_pallas_kernel(x_ref, w_ref, out_ref, scratch_refs):
 
     All arrays are in VMEM and have dtype bfloat16.
     """
-
-    # TODO: your code here
-    pass
+    out_ref[:] = jnp.astype(pl.dot(x_ref[:], w_ref[:]), jnp.bfloat16)
 
 
 def all_gather_matmul_pallas_scratch_specs(x):
     return {
-        # TODO: your code here
+        "x_gathered": pltpu.VMEM(shape=(N_BATCH, K1), dtype=jnp.bfloat16),
+        "send1_sems": pltpu.SemaphoreType.DMA(shape=(4,)),
+        "recv1_sems": pltpu.SemaphoreType.DMA(shape=(4,)),
+        "send2_sems": pltpu.SemaphoreType.DMA(shape=(2,)),
+        "recv2_sems": pltpu.SemaphoreType.DMA(shape=(2,)),
     }
 
 
@@ -196,20 +197,150 @@ def all_gather_matmul_pallas_kernel(x_ref, w1_ref, out_ref, scratch_refs):
     Computes all_gather(x_ref) @ w1_ref, where the gather occurs along the second dimension.
 
     Shapes:
-    * x_ref: [N_BATCH, K1 / N_DEVICES]
-    * w1_ref: [K1, K2]
-    * out_ref: [N_BATCH, K2]
+    * x_ref: [N_BATCH, K1 / N_DEVICES] = [256, 256]
+    * w1_ref: [K1, K2] = [1024, 4096]
+    * out_ref: [N_BATCH, K2] = [256, 4096]
 
     All arrays are in VMEM and have dtype bfloat16.
     """
+    my_device = pallas_get_my_device_id()
+    chunk_size = K1 // N_DEVICES
+    half_size = chunk_size // 2
+    
+    next_device = (my_device + 1) % N_DEVICES
+    prev_device = (my_device - 1 + N_DEVICES) % N_DEVICES
+    opposite_device = (my_device + 2) % N_DEVICES
+    
+    send1_sems = scratch_refs["send1_sems"]
+    recv1_sems = scratch_refs["recv1_sems"]
+    send2_sems = scratch_refs["send2_sems"]
+    recv2_sems = scratch_refs["recv2_sems"]
+    x_gathered = scratch_refs["x_gathered"]
+        
+    # round 1: send x_ref in two halves to neighbors' out_ref
+    # send first half to next device (clockwise)
+    pallas_rdma_start(
+        src_ref=x_ref.at[:, pl.ds(0, half_size)],
+        dst_ref=x_gathered.at[:, pl.ds(my_device * chunk_size, half_size)],
+        dst_device_id=next_device,
+        src_send_sem=send1_sems.at[0],
+        dst_recv_sem=recv1_sems.at[0]
+    )
+    
+    # send second half to next device (clockwise)
+    pallas_rdma_start(
+        src_ref=x_ref.at[:, pl.ds(half_size, half_size)],
+        dst_ref=x_gathered.at[:, pl.ds(my_device * chunk_size + half_size, half_size)],
+        dst_device_id=next_device,
+        src_send_sem=send1_sems.at[1],
+        dst_recv_sem=recv1_sems.at[1]
+    )
+    
+    # send first half to prev device (counter-clockwise)
+    pallas_rdma_start(
+        src_ref=x_ref.at[:, pl.ds(0, half_size)],
+        dst_ref=x_gathered.at[:, pl.ds(my_device * chunk_size, half_size)],
+        dst_device_id=prev_device,
+        src_send_sem=send1_sems.at[2],
+        dst_recv_sem=recv1_sems.at[2]
+    )
+    
+    # send second half to prev device (counter-clockwise)
+    pallas_rdma_start(
+        src_ref=x_ref.at[:, pl.ds(half_size, half_size)],
+        dst_ref=x_gathered.at[:, pl.ds(my_device * chunk_size + half_size, half_size)],
+        dst_device_id=prev_device,
+        src_send_sem=send1_sems.at[3],
+        dst_recv_sem=recv1_sems.at[3]
+    )
 
-    # TODO: your code here
-    pass
+    x_gathered[:, pl.ds(my_device * chunk_size, chunk_size)] = x_ref[:]
+    out_ref[:] = jnp.astype(
+        pl.dot(x_gathered[:, pl.ds(my_device * chunk_size, chunk_size)], 
+               w1_ref[pl.ds(my_device * chunk_size, chunk_size), :]), 
+        jnp.bfloat16
+    )
+
+    pallas_rdma_wait_recv(dst_ref=x_gathered.at[:, pl.ds(prev_device * chunk_size, half_size)], dst_recv_sem=recv1_sems.at[0])
+    out_ref[:] = jnp.astype(
+        out_ref[:].astype(jnp.float32) + 
+        pl.dot(x_gathered[:, pl.ds(prev_device * chunk_size, half_size)],
+               w1_ref[pl.ds(prev_device * chunk_size, half_size), :]),
+        jnp.bfloat16
+    )
+    
+    pallas_rdma_start(
+        src_ref=x_gathered.at[:, pl.ds(prev_device * chunk_size + half_size, half_size)],
+        dst_ref=x_gathered.at[:, pl.ds(prev_device * chunk_size + half_size, half_size)],
+        dst_device_id=next_device,
+        src_send_sem=send2_sems.at[0],
+        dst_recv_sem=recv2_sems.at[0]
+    )
+    
+    pallas_rdma_wait_recv(dst_ref=x_gathered.at[:, pl.ds(next_device * chunk_size, half_size)], dst_recv_sem=recv1_sems.at[2])
+    out_ref[:] = jnp.astype(
+        out_ref[:].astype(jnp.float32) + 
+        pl.dot(x_gathered[:, pl.ds(next_device * chunk_size, half_size)],
+               w1_ref[pl.ds(next_device * chunk_size, half_size), :]),
+        jnp.bfloat16
+    )
+    
+    pallas_rdma_start(
+        src_ref=x_gathered.at[:, pl.ds(next_device * chunk_size, half_size)],
+        dst_ref=x_gathered.at[:, pl.ds(next_device * chunk_size, half_size)],
+        dst_device_id=prev_device,
+        src_send_sem=send2_sems.at[1],
+        dst_recv_sem=recv2_sems.at[1]
+    )
+    
+    pallas_rdma_wait_recv(dst_ref=x_gathered.at[:, pl.ds(prev_device * chunk_size + half_size, half_size)], dst_recv_sem=recv1_sems.at[1])
+    out_ref[:] = jnp.astype(
+        out_ref[:].astype(jnp.float32) + 
+        pl.dot(x_gathered[:, pl.ds(prev_device * chunk_size + half_size, half_size)],
+               w1_ref[pl.ds(prev_device * chunk_size + half_size, half_size), :]),
+        jnp.bfloat16
+    )
+    
+    pallas_rdma_wait_recv(dst_ref=x_gathered.at[:, pl.ds(next_device * chunk_size + half_size, half_size)], dst_recv_sem=recv1_sems.at[3])
+    out_ref[:] = jnp.astype(
+        out_ref[:].astype(jnp.float32) + 
+        pl.dot(x_gathered[:, pl.ds(next_device * chunk_size + half_size, half_size)],
+               w1_ref[pl.ds(next_device * chunk_size + half_size, half_size), :]),
+        jnp.bfloat16
+    )
+    
+    pallas_rdma_wait_recv(dst_ref=x_gathered.at[:, pl.ds(opposite_device * chunk_size + half_size, half_size)], dst_recv_sem=recv2_sems.at[0])
+    out_ref[:] = jnp.astype(
+        out_ref[:].astype(jnp.float32) + 
+        pl.dot(x_gathered[:, pl.ds(opposite_device * chunk_size + half_size, half_size)],
+               w1_ref[pl.ds(opposite_device * chunk_size + half_size, half_size), :]),
+        jnp.bfloat16
+    )
+    
+    pallas_rdma_wait_recv(dst_ref=x_gathered.at[:, pl.ds(opposite_device * chunk_size, half_size)], dst_recv_sem=recv2_sems.at[1])
+    out_ref[:] = jnp.astype(
+        out_ref[:].astype(jnp.float32) + 
+        pl.dot(x_gathered[:, pl.ds(opposite_device * chunk_size, half_size)],
+               w1_ref[pl.ds(opposite_device * chunk_size, half_size), :]),
+        jnp.bfloat16
+    )
+    
+    pallas_rdma_wait_send(src_ref=x_ref.at[:, pl.ds(0, half_size)], src_send_sem=send1_sems.at[0])
+    pallas_rdma_wait_send(src_ref=x_ref.at[:, pl.ds(half_size, half_size)], src_send_sem=send1_sems.at[1])
+    pallas_rdma_wait_send(src_ref=x_ref.at[:, pl.ds(0, half_size)], src_send_sem=send1_sems.at[2])
+    pallas_rdma_wait_send(src_ref=x_ref.at[:, pl.ds(half_size, half_size)], src_send_sem=send1_sems.at[3])
+    pallas_rdma_wait_send(src_ref=x_gathered.at[:, pl.ds(prev_device * chunk_size + half_size, half_size)], src_send_sem=send2_sems.at[0])
+    pallas_rdma_wait_send(src_ref=x_gathered.at[:, pl.ds(next_device * chunk_size, half_size)], src_send_sem=send2_sems.at[1])
 
 
 def matmul_reduce_scatter_pallas_scratch_specs(x):
+    chunk_size = K1 // N_DEVICES
     return {
-        # TODO: your code here
+        "recv_next": pltpu.VMEM(shape=(x.shape[0], chunk_size), dtype=jnp.bfloat16),
+        "recv_prev": pltpu.VMEM(shape=(x.shape[0], chunk_size), dtype=jnp.bfloat16),
+        "recv_opp": pltpu.VMEM(shape=(x.shape[0], chunk_size), dtype=jnp.bfloat16),
+        "send_sems": pltpu.SemaphoreType.DMA(shape=(3,)),
+        "recv_sems": pltpu.SemaphoreType.DMA(shape=(3,)),
     }
 
 
@@ -218,18 +349,25 @@ def matmul_reduce_scatter_pallas_kernel(x_ref, w2_ref, out_ref, scratch_refs):
     Computes reduce_scatter(x_ref @ w2_ref), sharded along the second dimension.
 
     Shapes:
-    * x_ref: [N_BATCH, K2]
-    * w2_ref: [K2, K1]
-    * out_ref: [N_BATCH, K1 / N_DEVICES]
+    * x_ref: [N_BATCH, K2] = [256, 4096]
+    * w2_ref: [K2, K1] = [4096, 1024]
+    * out_ref: [N_BATCH, K1 / N_DEVICES] = [256, 256]
     """
-
-    # TODO: your code here
-    pass
-
-
+    my_device = pallas_get_my_device_id()
+    chunk_size = K1 // N_DEVICES
+    
+    next_device = (my_device + 1) % N_DEVICES
+    prev_device = (my_device - 1 + N_DEVICES) % N_DEVICES
+    opposite_device = (my_device + 2) % N_DEVICES
+    
+    send_sems = scratch_refs["send_sems"]
+    recv_sems = scratch_refs["recv_sems"]
+    recv_next = scratch_refs["recv_next"]
+    recv_prev = scratch_refs["recv_prev"]
+    recv_opp = scratch_refs["recv_opp"]
+    
 def neural_network_pallas_scratch_specs(x, w1_refs, w2_refs):
     return {
-        # TODO: your code here
     }
 
 
@@ -251,8 +389,6 @@ def neural_network_pallas_kernel(init_x_ref, w1_refs, w2_refs, out_ref, scratch_
     * w2_refs: List of Pallas array refs each with shape [K2, K1]. Read-only.
     * out_ref: Pallas array reference with shape [N_BATCH, K1]. Should be written to.
     """
-
-    # TODO: your code here
     pass
 
 
